@@ -1,170 +1,194 @@
 import pg8000
 import urllib.parse
-import csv
 import os
 import time
+import gc
 import sys
-from datetime import datetime
 
-# URL de conexão com o banco de dados (substitua com sua URL), corrija o DATABASE_URL pelo fornecido em https://vercel.com/ "XXXXXXXXXX" é apenas um exemplo
+# Não altere minhas Variáveis:
+hex_inicial = '40000000000000000'
+hex_final = '7ffffffffffffffff'
+percentual = float("0.0000001")
+valor_inicial = int(hex_inicial, 16)
+valor_final = int(hex_final, 16)
 DATABASE_URL = "postgres://neondb_owner:XXXXXXXXXX@ep-polished-unit-a4b64eos-pooler.us-east-1.aws.neon.tech/neondb?sslmode=require" 
+arquivo_progresso = 'progresso.txt'
+envioacada = 100  # Descrição: Define o número de registros a serem inseridos no banco de dados em cada lote.
 
-# Função para obter o último valor processado no CSV
-def obter_ultimo_valor_processado(caminho_csv):
-    if os.path.exists(caminho_csv):
-        with open(caminho_csv, mode='r', newline='') as file:
-            leitor_csv = csv.reader(file)
-            for linha in leitor_csv:
-                return int(linha[0], 16)  # Retorna o último valor hexadecimal processado
-    return 0  # Caso o CSV não exista ou esteja vazio
-
-# Função para registrar o último valor processado no CSV
-def registrar_ultimo_valor(caminho_csv, valor_processado):
-    with open(caminho_csv, mode='w', newline='') as file:
-        escritor_csv = csv.writer(file)
-        escritor_csv.writerow([hex(valor_processado)])  # Escreve o último valor processado em hexadecimal
+# Função para reiniciar o script automaticamente
+def reiniciar_script():
+    print("Erro de rede detectado. Tentando novamente...")
+    time.sleep(3)  # Espera 3 segundos antes de reiniciar
+    os.execv(sys.executable, [sys.executable] + sys.argv)  # Reinicia o script
 
 # Função para estabelecer uma nova conexão
 def conectar_ao_banco():
-    url = urllib.parse.urlparse(DATABASE_URL)
-    return pg8000.connect(
-        user=url.username, password=url.password,
-        host=url.hostname, database=url.path[1:],  # Remover a primeira barra para o nome do banco
-        port=5432,  # Porta padrão do PostgreSQL
-        ssl_context=True  # Habilitar SSL
-    )
+    try:
+        url = urllib.parse.urlparse(DATABASE_URL)
+        return pg8000.connect(
+            user=url.username, password=url.password,
+            host=url.hostname, database=url.path[1:],  # Remover a primeira barra para o nome do banco
+            port=5432,  # Porta padrão do PostgreSQL
+            ssl_context=True  # Habilitar SSL
+        )
+    except Exception as e:
+        print(f"Erro ao conectar ao banco de dados: {e}")
+        raise
 
-# Função para criar a tabela puzzle67 caso ela não exista e adicionar a restrição de unicidade
-def criar_tabela():
+# Função para verificar se a tabela existe, e criar caso não exista
+def verificar_tabela():
     connection = conectar_ao_banco()
     cursor = connection.cursor()
+    try:
+        cursor.execute("SELECT to_regclass('public.puzzle67');")
+        result = cursor.fetchone()
+        if result[0] is None:
+            print("Tabela 'puzzle67' não existe. Criando agora...")
+            criar_tabela()  # Cria a tabela se não existir
+        else:
+            print("Tabela 'puzzle67' já existe.")
+    except Exception as e:
+        print(f"Erro ao verificar a tabela: {e}")
+    finally:
+        cursor.close()
+        connection.close()
 
+# Função para criar a tabela no banco de dados
+def criar_tabela():
+    connection = conectar_ao_banco()
+    cursor = connection.cursor() 
     try:
         # Criar a tabela se não existir
         create_table_query = '''
-            CREATE TABLE IF NOT EXISTS puzzle67 (
-                inicio TEXT PRIMARY KEY,
-                fim TEXT,
-                durante TEXT,
-                bloqueada BOOLEAN
-            );
+        CREATE TABLE IF NOT EXISTS puzzle67 (
+            inicio TEXT PRIMARY KEY,
+            fim TEXT,
+            durante TEXT,
+            bloqueada BOOLEAN
+        );
         '''
         cursor.execute(create_table_query)
 
         # Adicionar a restrição de unicidade para as colunas 'inicio' e 'fim'
         add_unique_constraint_query = '''
-            ALTER TABLE puzzle67 ADD CONSTRAINT unique_inicio_fim UNIQUE (inicio, fim);
+        DO $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'unique_inicio_fim') THEN
+                ALTER TABLE puzzle67 ADD CONSTRAINT unique_inicio_fim UNIQUE (inicio, fim);
+            END IF;
+        END $$;
         '''
-        try:
-            cursor.execute(add_unique_constraint_query)
-        except pg8000.exceptions.DatabaseError:
-            # Se a restrição já existir, não faz nada
-            pass
-        
+        cursor.execute(add_unique_constraint_query)
+
         connection.commit()
         print("Tabela 'puzzle67' verificada/criada com sucesso!")
     except pg8000.exceptions.DatabaseError as e:
         print(f"Erro ao criar a tabela: {e}")
+        connection.rollback()  # Fazer rollback em caso de erro
+    except Exception as e:
+        print(f"Erro inesperado ao criar a tabela: {e}")
+        connection.rollback()  # Rollback se qualquer outro erro ocorrer
     finally:
         cursor.close()
         connection.close()
 
-# Função para reiniciar o script automaticamente
-def reiniciar_script():
-    print("Erro de rede detectado. Reiniciando o script...")
-    time.sleep(3)  # Espera 3 segundos antes de reiniciar
-    os.execv(sys.executable, [sys.executable] + sys.argv)  # Reinicia o script
+# Função para ler o último valor de inicio_intervalo salvo
+def ler_ultimo_progresso():
+    if os.path.exists(arquivo_progresso):
+        with open(arquivo_progresso, 'r') as f:
+            return int(f.read().strip(), 16)
+    return valor_inicial  # Se não houver progresso salvo, começa do valor inicial
 
-# Função para gerar intervalos e inserir os dados na tabela
-def gerar_intervalos(valor_inicial, valor_final, percentual, caminho_csv):
-    num_divisoes = int(100 / percentual)
-    intervalo_tamanho = (valor_final - valor_inicial) // num_divisoes
-    dados_batch = []
-    contador = 0
+# Função para salvar o último valor de inicio_intervalo
+def salvar_progresso(inicio_intervalo):
+    with open(arquivo_progresso, 'w') as f:
+        f.write(hex(inicio_intervalo))
+
+def gerar_tabela(valor_inicial, valor_final, percentual): 
+    num_divisoes = int(100 / percentual) 
+    intervalo_tamanho = (valor_final - valor_inicial) // num_divisoes 
+    contador = 0 
+
+    # Lê o último progresso salvo
+    inicio_intervalo = ler_ultimo_progresso()
     
-    # Reabrir conexão ao banco de dados
-    connection = conectar_ao_banco()
-    cursor = connection.cursor()
-
-    try:
-        for i in range(num_divisoes):
-            inicio = valor_inicial + i * intervalo_tamanho
-            fim = valor_inicial + (i + 1) * intervalo_tamanho
-            
-            # Para garantir que o último intervalo chegue exatamente no valor final
-            if i == num_divisoes - 1:
-                fim = valor_final
-
-            # Convertendo os valores de "inicio" e "fim" para hexadecimal e em formato de texto
-            inicio_texto = hex(inicio)
-            fim_texto = hex(fim)
-            durante = None
-            bloqueada = False
-
-            # Adicionar o registro na lista de dados a serem inseridos
-            dados_batch.append((inicio_texto, fim_texto, durante, bloqueada))
-
-            # Inserir em batch
-            if len(dados_batch) >= envioacada:
-                try:
-                    insert_data_query = '''INSERT INTO puzzle67 (inicio, fim, durante, bloqueada) 
-                                           VALUES (%s, %s, %s, %s)
-                                           ON CONFLICT (inicio, fim) DO NOTHING;'''
-                    cursor.executemany(insert_data_query, dados_batch)
-                    connection.commit()
-                    dados_batch.clear()
-                    contador += envioacada
-                    print(f"{contador} intervalos processados.")
-                    # Registrar o último valor processado no CSV
-                    registrar_ultimo_valor(caminho_csv, fim)
-                except pg8000.exceptions.InterfaceError as e:
-                    reiniciar_script()  # Se houver erro de rede, reinicia o script
-
-        # Inserir qualquer dado restante que não tenha sido inserido em batch
-        if dados_batch:
+    # Calculando o índice do intervalo a ser processado
+    i = (inicio_intervalo - valor_inicial) // intervalo_tamanho
+    if i < 0:
+        i = 0  # Garante que o valor de i não fique negativo
+    
+    dados_batch = []  # Lista para acumular os dados para envio em lote
+    
+    for i in range(i, num_divisoes):
+        inicio_intervalo = valor_inicial + i * intervalo_tamanho
+        fim_intervalo = valor_inicial + (i + 1) * intervalo_tamanho
+        if i == num_divisoes - 1:
+            fim_intervalo = valor_final 
+        total = fim_intervalo - inicio_intervalo + 1 
+        print(f"Intervalo {i + 1:,.0f} de {num_divisoes:,.0f}: {hex(inicio_intervalo)} até {hex(fim_intervalo)} (inclusive) é: {total:,.0f}") 
+        contador += 1 
+        
+        # Adiciona o intervalo atual ao batch
+        dados_batch.append((hex(inicio_intervalo), hex(fim_intervalo), None, False))
+        
+        # Envia o batch se atingir o tamanho definido por envioacada
+        if len(dados_batch) >= envioacada:
             try:
+                # Conectar ao banco e inserir os dados em lote
+                connection = conectar_ao_banco()
+                cursor = connection.cursor()
                 insert_data_query = '''INSERT INTO puzzle67 (inicio, fim, durante, bloqueada) 
                                        VALUES (%s, %s, %s, %s)
                                        ON CONFLICT (inicio, fim) DO NOTHING;'''
                 cursor.executemany(insert_data_query, dados_batch)
                 connection.commit()
-                # Registrar o último valor processado no CSV
-                registrar_ultimo_valor(caminho_csv, fim)
+                dados_batch.clear()  # Limpar o batch após o envio
+                connection.close()
+
+                contador += envioacada
+                print(f"{contador} intervalos processados.")
+                
             except pg8000.exceptions.InterfaceError as e:
-                reiniciar_script()  # Se houver erro de rede, reinicia o script
+                print(f"Erro ao enviar batch de dados: {e}. Reiniciando o script.")
+                reiniciar_script()  # Caso ocorra um erro de conexão, reinicia o script
 
-        print("Intervalos processados com sucesso!")
-    finally:
-        cursor.close()
-        connection.close()
+            # Coleta o lixo após cada envio de batch
+            print("Coletando lixo após envio de batch...")
+            gc.collect()
 
-# Caminho do arquivo CSV para salvar o último valor processado
-caminho_csv = 'ultimo_valor_processado.csv'
+        # Salva o progresso após cada intervalo
+        salvar_progresso(inicio_intervalo)
 
-# Números hexadecimais (valores de entrada)
-hex_inicial = '40000000000000000'
-hex_final = '7ffffffffffffffff'
+        # Coleta o lixo após um número de intervalos processados
+        if contador % 1000 == 0:
+            print(f"{contador} intervalos processados. Coletando lixo...")
+            gc.collect()
 
-# Convertendo os números hexadecimais para inteiros
-valor_inicial = int(hex_inicial, 16)
-valor_final = int(hex_final, 16)
+        # time.sleep(4)  # Para não sobrecarregar a conexão com o banco
 
-# Solicitar ao usuário o percentual
-percentual = float("0.0000001")
-envioacada = 20  # Inserir registros em lotes de 20
+    # Envia qualquer dado restante no batch (caso o número total de registros não seja múltiplo de envioacada)
+    if dados_batch:
+        try:
+            connection = conectar_ao_banco()
+            cursor = connection.cursor()
+            insert_data_query = '''INSERT INTO puzzle67 (inicio, fim, durante, bloqueada) 
+                                   VALUES (%s, %s, %s, %s)
+                                   ON CONFLICT (inicio, fim) DO NOTHING;'''
+            cursor.executemany(insert_data_query, dados_batch)
+            connection.commit()
+            cursor.close()
+            connection.close()
+            print(f"{contador} intervalos processados.")
+        except pg8000.exceptions.InterfaceError as e:
+            print(f"Erro ao enviar batch final de dados: {e}. Reiniciando o script.")
+            reiniciar_script()  # Caso ocorra um erro de conexão, reinicia o script
 
-# Verificar onde parar com base no CSV
-ultimo_valor_processado = obter_ultimo_valor_processado(caminho_csv)
+        # Coleta o lixo após o envio do último batch
+        print("Coletando lixo após envio final de batch...")
+        gc.collect()
 
-# Ajustar o valor inicial para o último processado
-valor_inicial = ultimo_valor_processado
+# Chamada da função para verificar a tabela antes de gerar os dados
+verificar_tabela()
 
-# Garantindo que o percentual está entre 0.000001% e 100%
-if percentual <= 0 or percentual > 100:
-    print("Por favor, insira um percentual maior que 0 e menor ou igual a 100%.")
-else:
-    # Criar a tabela, caso não exista e adicionar a restrição de unicidade
-    criar_tabela()
-    
-    # Gerar os intervalos e inserir os dados na tabela
-    gerar_intervalos(valor_inicial, valor_final, percentual, caminho_csv)
+# Chamada da função para gerar a tabela com os parâmetros corretos
+gerar_tabela(valor_inicial, valor_final, percentual)
