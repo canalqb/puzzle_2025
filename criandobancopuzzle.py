@@ -7,7 +7,7 @@ import sys
 from datetime import datetime
 
 # URL de conexão com o banco de dados (substitua com sua URL), corrija o DATABASE_URL pelo fornecido em https://vercel.com/ "XXXXXXXXXX" é apenas um exemplo
-DATABASE_URL = "postgres://neondb_owner:XXXXXXXXXX@ep-polished-unit-a4b64eos-pooler.us-east-1.aws.neon.tech/neondb?sslmode=require"
+DATABASE_URL = "postgres://neondb_owner:XXXXXXXXXX@ep-polished-unit-a4b64eos-pooler.us-east-1.aws.neon.tech/neondb?sslmode=require" 
 
 # Função para obter o último valor processado no CSV
 def obter_ultimo_valor_processado(caminho_csv):
@@ -33,6 +33,41 @@ def conectar_ao_banco():
         port=5432,  # Porta padrão do PostgreSQL
         ssl_context=True  # Habilitar SSL
     )
+
+# Função para criar a tabela puzzle67 caso ela não exista e adicionar a restrição de unicidade
+def criar_tabela():
+    connection = conectar_ao_banco()
+    cursor = connection.cursor()
+
+    try:
+        # Criar a tabela se não existir
+        create_table_query = '''
+            CREATE TABLE IF NOT EXISTS puzzle67 (
+                inicio TEXT PRIMARY KEY,
+                fim TEXT,
+                durante TEXT,
+                bloqueada BOOLEAN
+            );
+        '''
+        cursor.execute(create_table_query)
+
+        # Adicionar a restrição de unicidade para as colunas 'inicio' e 'fim'
+        add_unique_constraint_query = '''
+            ALTER TABLE puzzle67 ADD CONSTRAINT unique_inicio_fim UNIQUE (inicio, fim);
+        '''
+        try:
+            cursor.execute(add_unique_constraint_query)
+        except pg8000.exceptions.DatabaseError:
+            # Se a restrição já existir, não faz nada
+            pass
+        
+        connection.commit()
+        print("Tabela 'puzzle67' verificada/criada com sucesso!")
+    except pg8000.exceptions.DatabaseError as e:
+        print(f"Erro ao criar a tabela: {e}")
+    finally:
+        cursor.close()
+        connection.close()
 
 # Função para reiniciar o script automaticamente
 def reiniciar_script():
@@ -128,5 +163,8 @@ valor_inicial = ultimo_valor_processado
 if percentual <= 0 or percentual > 100:
     print("Por favor, insira um percentual maior que 0 e menor ou igual a 100%.")
 else:
+    # Criar a tabela, caso não exista e adicionar a restrição de unicidade
+    criar_tabela()
+    
     # Gerar os intervalos e inserir os dados na tabela
     gerar_intervalos(valor_inicial, valor_final, percentual, caminho_csv)
